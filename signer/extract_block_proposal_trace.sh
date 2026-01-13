@@ -1,128 +1,209 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env python3
+import sys
+import re
+from datetime import datetime, timezone
 
-# Import all the helper functions
-script_dir="$(cd "$(dirname "$0")" && pwd)"
-source "$script_dir/../common.sh"
+# ----------------------------
+# Config: patterns (update if logging changes)
+# ----------------------------
+EVENT_PATTERNS = [
+    ("proposal",         "received a block proposal"),
+    ("validation",       "submitting block proposal for validation"),
+    ("precommit",        "Broadcasting block pre-commit to stacks node for"),
+    ("block_accepted",   "block response to stacks node: Accepted"),
+    ("block_rejected",   "block response to stacks node: Rejected"),
+    ("global_approval",  "acceptance and have reached"),
+    ("global_rejection", "rejection and have reached"),
+    ("push",             "Got block pushed message"),
+    ("push",             "Received a new block event"),
+]
 
-# Read from file if provided, else stdin
-if [[ -n "${1-}" && -f "$1" ]]; then
-    input_source="$1"
-elif [ ! -t 0 ]; then
-    input_source="/dev/stdin"
-else
-    echo "Usage: $0 <log_file> or pipe log data into stdin"
-    exit 1
-fi
+# ----------------------------
+# Regex helpers
+# ----------------------------
+# Timestamp formats:
+#   [2026-01-12 07:27:37]
+#   [12345.678] (mac-style float seconds)
+TS_HUMAN_RE = re.compile(r"\[(20\d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
+TS_MAC_RE   = re.compile(r"\[(\d+\.\d+)\]")
 
-# Clean up our garbage!
-tmp_dir=$(mktemp -d)
-trap "rm -rf $tmp_dir" EXIT
+# signer_signature_hash: <64hex>   OR signer_signature_hash=<64hex>
+SIGNER_HASH_RE = re.compile(r"signer_signature_hash\s*[:=]\s*([0-9a-fA-F]{64})")
 
-# Track all signer_signature_hash's we encounter
-all_signers_file="$tmp_dir/all_signers.txt"
-touch "$all_signers_file"
+# precommit line: "... for <64hex>"
+PRECOMMIT_FOR_RE = re.compile(r"\bfor\s+([0-9a-fA-F]{64})\b")
 
-while IFS= read -r line; do
-    timestamp=$(extract_timestamp "$line")
-    [[ -z "$timestamp" ]] && continue
+def parse_timestamp(line: str):
+    """
+    Return timestamp as float seconds since epoch (or float seconds if mac format),
+    or None if no timestamp.
+    """
+    m = TS_MAC_RE.search(line)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
 
-    # MAKE SURE YOU UPDATE THESE IF LOGGING HAS CHANGED...
-    if echo "$line" | grep -q "received a block proposal"; then
-        signer_hash=$(extract_signer_signature_hash "$line")
-        [[ -n "$signer_hash" ]] && {
-            save_time "$tmp_dir" proposal "$signer_hash" "$timestamp"
-            echo "$signer_hash" >> "$all_signers_file"
-        }
-    elif echo "$line" | grep -q "submitting block proposal for validation"; then
-        signer_hash=$(extract_signer_signature_hash "$line")
-        [[ -n "$signer_hash" ]] && save_time "$tmp_dir" validation "$signer_hash" "$timestamp"
-    elif echo "$line" | grep -q "Broadcasting block pre-commit to stacks node for"; then
-        signer_hash=$(echo "$line" | sed -n 's/.*for \([0-9a-fA-F]\{64\}\).*/\1/p')
-        [[ -n "$signer_hash" ]] && save_time "$tmp_dir" precommit "$signer_hash" "$timestamp"
-    elif echo "$line" | grep -q "block response to stacks node: Accepted"; then
-        signer_hash=$(extract_signer_signature_hash "$line")
-        [[ -n "$signer_hash" ]] && save_time "$tmp_dir" block_accepted "$signer_hash" "$timestamp"
-    elif echo "$line" | grep -q "block response to stacks node: Rejected"; then
-        signer_hash=$(extract_signer_signature_hash "$line")
-        [[ -n "$signer_hash" ]] && save_time "$tmp_dir" block_rejected "$signer_hash" "$timestamp"
-    elif echo "$line" | grep -q "Received block acceptance and have reached"; then
-        signer_hash=$(extract_signer_signature_hash "$line")
-        [[ -n "$signer_hash" ]] && save_time "$tmp_dir" global_approval "$signer_hash" "$timestamp"
-    elif echo "$line" | grep -q "Received block rejection and have reached"; then
-        signer_hash=$(extract_signer_signature_hash "$line")
-        [[ -n "$signer_hash" ]] && save_time "$tmp_dir" global_rejection "$signer_hash" "$timestamp"
-    #we should treat either a block pushed or a block new event as our Push time (take the earliest of the two)
-    elif echo "$line" | grep -q "Got block pushed message"; then
-        signer_hash=$(extract_signer_signature_hash "$line")
-        [[ -n "$signer_hash" ]] && maybe_save_earlier_time "$tmp_dir" push "$signer_hash" "$timestamp"
-    elif echo "$line" | grep -q "Received a new block event"; then
-        signer_hash=$(extract_signer_signature_hash "$line")
-        [[ -n "$signer_hash" ]] && maybe_save_earlier_time "$tmp_dir" push "$signer_hash" "$timestamp"
-    fi
-done < "$input_source"
+    m = TS_HUMAN_RE.search(line)
+    if not m:
+        return None
 
-# Deduplicate signer signature hashes
-sort -u "$all_signers_file" -o "$all_signers_file"
+    ts_str = m.group(1)
+    # Interpret as local time? Your log is wall-clock; use naive->epoch as local.
+    # If you want strict UTC, adjust here.
+    try:
+        dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        # Treat as local time (naive). Convert by timestamp() assuming local tz.
+        return dt.timestamp()
+    except Exception:
+        return None
 
-# Column headers
-columns=("Signer Signature Hash" "Proposal" "Validation" "Pre-Commit" "Block Accepted" "Block Rejected" "Global Approval" "Global Rejection" "ΔProposal→Push (s)")
+def extract_signer_hash(line: str):
+    m = SIGNER_HASH_RE.search(line)
+    return m.group(1) if m else None
 
-# Fixed widths (adjusted for readability)
-widths=(64 20 20 20 20 20 20 20 20)
+def extract_precommit_hash(line: str):
+    m = PRECOMMIT_FOR_RE.search(line)
+    return m.group(1) if m else None
 
-# Compute total table width
-total_width=0
-for w in "${widths[@]}"; do
-    total_width=$((total_width + w))
-done
-total_width=$((total_width + ${#widths[@]}*3 - 1))  # account for separators " | "
+def set_time(times_by_event, event: str, h: str, ts: float):
+    # Keep first observed time for that event/hash (matches prior behavior)
+    d = times_by_event[event]
+    if h not in d:
+        d[h] = ts
 
-# Print header
-header_line=""
-for i in "${!columns[@]}"; do
-    header_line+=$(printf "%-${widths[i]}s" "${columns[i]}")
-    [[ $i -lt $((${#columns[@]}-1)) ]] && header_line+=" | "
-done
-echo "$header_line"
+def set_earliest_time(times_by_event, event: str, h: str, ts: float):
+    # Keep earliest observed time (push event wants earliest of "new block" and "pushed")
+    d = times_by_event[event]
+    cur = d.get(h)
+    if cur is None or ts < cur:
+        d[h] = ts
 
-# Print separator
-printf '%*s\n' "$total_width" '' | tr ' ' '-'
+def fmt_ts(ts):
+    if ts is None:
+        return "-"
+    # Match previous output style: seconds since epoch (integer-ish)
+    # Keep as integer string for readability
+    return str(int(ts))
 
-# Initialize totals
-total=0
-count=0
+def main():
+    # Input: file if provided, else stdin
+    if len(sys.argv) >= 2 and sys.argv[1] != "-" :
+        path = sys.argv[1]
+        f = open(path, "r", errors="replace")
+    else:
+        f = sys.stdin
 
-# Print data rows
-while IFS= read -r signer_hash; do
-    prop=$(read_time "$tmp_dir" proposal "$signer_hash")
-    val=$(read_time "$tmp_dir" validation "$signer_hash")
-    pre=$(read_time "$tmp_dir" precommit "$signer_hash")
-    acc=$(read_time "$tmp_dir" block_accepted "$signer_hash")
-    rej=$(read_time "$tmp_dir" block_rejected "$signer_hash")
-    glob_app=$(read_time "$tmp_dir" global_approval "$signer_hash")
-    glob_rej=$(read_time "$tmp_dir" global_rejection "$signer_hash")
-    push=$(read_time "$tmp_dir" push "$signer_hash")
+    # event -> {hash -> ts}
+    times_by_event = {
+        "proposal": {},
+        "validation": {},
+        "precommit": {},
+        "block_accepted": {},
+        "block_rejected": {},
+        "global_approval": {},
+        "global_rejection": {},
+        "push": {},
+    }
 
-    if [[ "$prop" != "-" && "$push" != "-" ]]; then
-        delta=$(echo "$push - $prop" | bc -l)
-        delta_fmt=$(printf "%.3f" "$delta")
-        total=$(echo "$total + $delta_fmt" | bc -l)
-        ((count++))
-    else
-        delta_fmt="N/A"
-    fi
+    seen_hashes = set()
 
-    printf "%-${widths[0]}s | %-${widths[1]}s | %-${widths[2]}s | %-${widths[3]}s | %-${widths[4]}s | %-${widths[5]}s | %-${widths[6]}s | %-${widths[7]}s | %-${widths[8]}s\n" \
-        "$signer_hash" "$prop" "$val" "$pre" "$acc" "$rej" "$glob_app" "$glob_rej" "$delta_fmt"
-done < "$all_signers_file"
+    # Precompute substring checks (fast)
+    # We’ll scan line and only do regex extraction when one of these substrings matches.
+    event_substrings = EVENT_PATTERNS
 
-# Print average
-echo
-if (( count > 0 )); then
-    avg=$(echo "$total / $count" | bc -l)
-    avg_fmt=$(printf "%.3f" "$avg")
-    echo "Average ΔProposal→Push (s): $avg_fmt"
-else
-    echo "Average ΔProposal→Push (s): N/A (no complete proposal→push pairs)"
-fi
+    for line in f:
+        ts = parse_timestamp(line)
+        if ts is None:
+            continue
+
+        # Fast substring dispatch
+        for event, needle in event_substrings:
+            if needle in line:
+                if event == "precommit":
+                    h = extract_precommit_hash(line)
+                else:
+                    h = extract_signer_hash(line)
+
+                if not h:
+                    break
+
+                seen_hashes.add(h)
+
+                if event == "push":
+                    set_earliest_time(times_by_event, "push", h, ts)
+                else:
+                    set_time(times_by_event, event, h, ts)
+                break  # only one event per line expected
+
+    if f is not sys.stdin:
+        f.close()
+
+    # Output formatting
+    columns = [
+        "Signer Signature Hash",
+        "Proposal",
+        "Validation",
+        "Pre-Commit",
+        "Block Accepted",
+        "Block Rejected",
+        "Global Approval",
+        "Global Rejection",
+        "ΔProposal→Push (s)",
+    ]
+    widths = [64, 20, 20, 20, 20, 20, 20, 20, 20]
+
+    # Header
+    header = " | ".join(f"{c:<{widths[i]}}" for i, c in enumerate(columns))
+    print(header)
+    total_width = sum(widths) + (len(widths) * 3 - 1)
+    print("-" * total_width)
+
+    total_delta = 0.0
+    count = 0
+
+    for h in sorted(seen_hashes):
+        prop = times_by_event["proposal"].get(h)
+        val  = times_by_event["validation"].get(h)
+        pre  = times_by_event["precommit"].get(h)
+        acc  = times_by_event["block_accepted"].get(h)
+        rej  = times_by_event["block_rejected"].get(h)
+        ga   = times_by_event["global_approval"].get(h)
+        gr   = times_by_event["global_rejection"].get(h)
+        push = times_by_event["push"].get(h)
+
+        if prop is not None and push is not None:
+            delta = push - prop
+            delta_fmt = f"{delta:.3f}"
+            total_delta += delta
+            count += 1
+        else:
+            delta_fmt = "N/A"
+
+        row = [
+            h,
+            fmt_ts(prop),
+            fmt_ts(val),
+            fmt_ts(pre),
+            fmt_ts(acc),
+            fmt_ts(rej),
+            fmt_ts(ga),
+            fmt_ts(gr),
+            delta_fmt,
+        ]
+        print(" | ".join(f"{row[i]:<{widths[i]}}" for i in range(len(row))))
+
+    print()
+    if count > 0:
+        avg = total_delta / count
+        print(f"Average ΔProposal→Push (s): {avg:.3f}")
+    else:
+        print("Average ΔProposal→Push (s): N/A (no complete proposal→push pairs)")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        # allow piping to head, etc.
+        sys.exit(0)
