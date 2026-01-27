@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 
 # ----------------------------
 # Config: patterns (update if logging changes)
@@ -12,8 +12,8 @@ EVENT_PATTERNS = [
     ("precommit",        "Broadcasting block pre-commit to stacks node for"),
     ("block_accepted",   "block response to stacks node: Accepted"),
     ("block_rejected",   "block response to stacks node: Rejected"),
-    ("global_approval",  "acceptance and have reached"),
-    ("global_rejection", "rejection and have reached"),
+    ("global_approval",  "Received block acceptance and have reached"),
+    ("global_rejection", "Received block rejection and have reached"),
     ("push",             "Got block pushed message"),
     ("push",             "Received a new block event"),
 ]
@@ -67,36 +67,29 @@ def extract_precommit_hash(line: str):
     m = PRECOMMIT_FOR_RE.search(line)
     return m.group(1) if m else None
 
-def set_time(times_by_event, event: str, h: str, ts: float):
-    # Keep first observed time for that event/hash (matches prior behavior)
-    d = times_by_event[event]
+def set_first(d, h, ts):
+    """Set first observed timestamp only."""
     if h not in d:
         d[h] = ts
 
-def set_earliest_time(times_by_event, event: str, h: str, ts: float):
-    # Keep earliest observed time (push event wants earliest of "new block" and "pushed")
-    d = times_by_event[event]
+def set_earliest(d, h, ts):
+    """Keep earliest timestamp."""
     cur = d.get(h)
     if cur is None or ts < cur:
         d[h] = ts
 
 def fmt_ts(ts):
-    if ts is None:
-        return "-"
-    # Match previous output style: seconds since epoch (integer-ish)
-    # Keep as integer string for readability
-    return str(int(ts))
+    return "-" if ts is None else str(int(ts))
 
 def main():
     # Input: file if provided, else stdin
-    if len(sys.argv) >= 2 and sys.argv[1] != "-" :
-        path = sys.argv[1]
-        f = open(path, "r", errors="replace")
+    if len(sys.argv) >= 2 and sys.argv[1] != "-":
+        f = open(sys.argv[1], "r", errors="replace")
     else:
         f = sys.stdin
 
     # event -> {hash -> ts}
-    times_by_event = {
+    times = {
         "proposal": {},
         "validation": {},
         "precommit": {},
@@ -107,35 +100,43 @@ def main():
         "push": {},
     }
 
-    seen_hashes = set()
-
-    # Precompute substring checks (fast)
-    # We’ll scan line and only do regex extraction when one of these substrings matches.
-    event_substrings = EVENT_PATTERNS
+    seen = set()
 
     for line in f:
         ts = parse_timestamp(line)
         if ts is None:
             continue
 
-        # Fast substring dispatch
-        for event, needle in event_substrings:
-            if needle in line:
-                if event == "precommit":
-                    h = extract_precommit_hash(line)
-                else:
-                    h = extract_signer_hash(line)
+        # Allow multiple events per line (no early break)
+        for event, needle in EVENT_PATTERNS:
+            if needle not in line:
+                continue
 
-                if not h:
-                    break
+            if event == "precommit":
+                h = extract_precommit_hash(line)
+            else:
+                h = extract_signer_hash(line)
 
-                seen_hashes.add(h)
+            if not h:
+                continue
 
-                if event == "push":
-                    set_earliest_time(times_by_event, "push", h, ts)
-                else:
-                    set_time(times_by_event, event, h, ts)
-                break  # only one event per line expected
+            seen.add(h)
+
+            if event == "push":
+                # Push time = earliest of pushed/new-block events
+                set_earliest(times["push"], h, ts)
+
+                # Global Approval time should also be populated by push lines.
+                # Take the earliest between actual global-approval threshold and push visibility.
+                set_earliest(times["global_approval"], h, ts)
+
+            elif event == "global_approval":
+                # Global Approval = earliest (not first), because we might see multiple.
+                set_earliest(times["global_approval"], h, ts)
+
+            else:
+                # All other events: first time observed is good enough
+                set_first(times[event], h, ts)
 
     if f is not sys.stdin:
         f.close()
@@ -150,11 +151,11 @@ def main():
         "Block Rejected",
         "Global Approval",
         "Global Rejection",
+        "Push",
         "ΔProposal→Push (s)",
     ]
-    widths = [64, 20, 20, 20, 20, 20, 20, 20, 20]
+    widths = [64, 20, 20, 20, 20, 20, 20, 20, 20, 20]
 
-    # Header
     header = " | ".join(f"{c:<{widths[i]}}" for i, c in enumerate(columns))
     print(header)
     total_width = sum(widths) + (len(widths) * 3 - 1)
@@ -163,15 +164,15 @@ def main():
     total_delta = 0.0
     count = 0
 
-    for h in sorted(seen_hashes):
-        prop = times_by_event["proposal"].get(h)
-        val  = times_by_event["validation"].get(h)
-        pre  = times_by_event["precommit"].get(h)
-        acc  = times_by_event["block_accepted"].get(h)
-        rej  = times_by_event["block_rejected"].get(h)
-        ga   = times_by_event["global_approval"].get(h)
-        gr   = times_by_event["global_rejection"].get(h)
-        push = times_by_event["push"].get(h)
+    for h in sorted(seen):
+        prop = times["proposal"].get(h)
+        val  = times["validation"].get(h)
+        pre  = times["precommit"].get(h)
+        acc  = times["block_accepted"].get(h)
+        rej  = times["block_rejected"].get(h)
+        ga   = times["global_approval"].get(h)
+        gr   = times["global_rejection"].get(h)
+        push = times["push"].get(h)
 
         if prop is not None and push is not None:
             delta = push - prop
@@ -190,6 +191,7 @@ def main():
             fmt_ts(rej),
             fmt_ts(ga),
             fmt_ts(gr),
+            fmt_ts(push),
             delta_fmt,
         ]
         print(" | ".join(f"{row[i]:<{widths[i]}}" for i in range(len(row))))
